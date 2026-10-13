@@ -33,3 +33,90 @@ object RpiClient {
         if (!json.optString("status").equals("success", ignoreCase = true)) return null
         return json.optInt("task_id", -1).takeIf { it >= 0 }
     }
+
+    fun progress(ps4Ip: String, taskId: Int): JSONObject {
+        val raw = post(
+            ps4Ip,
+            "/api/get_task_progress",
+            JSONObject().put("task_id", taskId)
+        )
+        return JSONObject(normalizeJson(raw))
+    }
+
+    // Control commands: original RPI reads "task_id", the payload reads
+    // the command name as the key (e.g. {"stop_task": 215}). Send both.
+    private fun control(ip: String, cmd: String, taskId: Int): String =
+        post(ip, "/api/$cmd", JSONObject().put("task_id", taskId).put(cmd, taskId))
+
+    fun pause(ps4Ip: String, taskId: Int) = control(ps4Ip, "pause_task", taskId)
+
+    fun resume(ps4Ip: String, taskId: Int) = control(ps4Ip, "resume_task", taskId)
+
+    fun stop(ps4Ip: String, taskId: Int) = control(ps4Ip, "stop_task", taskId)
+
+    fun unregister(ps4Ip: String, taskId: Int) = control(ps4Ip, "unregister_task", taskId)
+
+    private fun post(ip: String, path: String, json: JSONObject): String {
+        val conn = (URL("http://$ip:12800$path").openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = 3000
+            readTimeout = 7000
+            doOutput = true
+            useCaches = false
+            setRequestProperty("Content-Type", "application/json")
+            setRequestProperty("Accept", "application/json")
+        }
+
+        conn.outputStream.use {
+            it.write(json.toString().toByteArray(Charsets.UTF_8))
+            it.flush()
+        }
+
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        val text = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
+
+        if (code !in 200..299) {
+            error("RPI respondeu HTTP $code: $text")
+        }
+        if (text.isBlank()) {
+            error("RPI respondeu sem corpo")
+        }
+        return text
+    }
+
+    private fun normalizeJson(raw: String): String {
+        return raw.replace(Regex("""0[xX][0-9a-fA-F]+""")) { match ->
+            val hex = match.value.substring(2)
+            runCatching { hex.toULong(16).toString() }.getOrElse { "0" }
+        }
+    }
+
+    fun bytesTotal(j: JSONObject): Long =
+        j.optLong("length_total", j.optLong("length", 0L))
+
+    fun bytesDone(j: JSONObject): Long =
+        j.optLong("transferred_total", j.optLong("transferred", 0L))
+
+    fun restSeconds(j: JSONObject): Long {
+        val total = j.optLong("rest_sec_total", -1L)
+        if (total > 0L) return total
+        return j.optLong("rest_sec", -1L)
+    }
+
+    fun percent(j: JSONObject): Int {
+        val total = bytesTotal(j)
+        val done = bytesDone(j)
+        return if (total > 0) {
+            ((done * 100L) / total).toInt().coerceIn(0, 100)
+        } else {
+            j.optInt("preparing_percent", 0).coerceIn(0, 100)
+        }
+    }
+
+    fun isFinished(j: JSONObject): Boolean {
+        val total = bytesTotal(j)
+        val done = bytesDone(j)
+        return total > 0 && done >= total
+    }
+}
