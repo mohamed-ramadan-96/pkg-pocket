@@ -17,12 +17,22 @@ object RpiClient {
 
     fun getPort(): Int = rpiPort
 
-    data class InstallResult(val taskId: Int?, val raw: String)
+    data class InstallResult(
+        val taskId: Int?,
+        val raw: String,
+        val title: String? = null
+    )
 
     class HttpException(
         val statusCode: Int,
         val responseBody: String
     ) : Exception("RPI HTTP $statusCode")
+
+    /** الـ payload رد بـ {"status":"fail", "error": ..., "message": ...} */
+    class PayloadException(
+        val nativeCode: Long,
+        val payloadMessage: String
+    ) : Exception("Payload: $payloadMessage ($nativeCode)")
 
     fun technicalDetail(error: Throwable): String =
         when (error) {
@@ -39,6 +49,9 @@ object RpiClient {
                 }
             }
 
+            is PayloadException ->
+                "Payload • ${error.payloadMessage} • código ${error.nativeCode}"
+
             else ->
                 "${error.javaClass.simpleName}: " +
                     (error.message ?: "sem detalhes")
@@ -48,31 +61,47 @@ object RpiClient {
 
     fun install(ps4Ip: String, pkgUrl: String): InstallResult {
         val body = JSONObject()
+            .put("url", pkgUrl)
             .put("type", "direct")
             .put("packages", org.json.JSONArray().put(pkgUrl))
-            // Payload compatibility: it expects {"url": "..."}
-            .put("url", pkgUrl)
 
         val raw = post(ps4Ip, "/api/install", body)
         val json = JSONObject(normalizeJson(raw))
+
+        // الـ payload بيرجّع status=fail مع كود الخطأ بدل HTTP error
+        if (json.optString("status").equals("fail", ignoreCase = true)) {
+            throw PayloadException(
+                json.optLong("error", 0L),
+                json.optString("message", "Falha ao registrar")
+            )
+        }
+
         val id = json.optInt("task_id", -1).takeIf { it >= 0 }
+        val title = json.optString("title").takeIf { it.isNotBlank() }
 
-        return InstallResult(id, raw)
+        return InstallResult(id, raw, title)
     }
 
-    fun findTask(ps4Ip: String, contentId: String, subType: Int): Int? {
-        val raw = post(
-            ps4Ip,
-            "/api/find_task",
-            JSONObject()
-                .put("content_id", contentId)
-                .put("sub_type", subType)
-        )
-
-        val json = JSONObject(normalizeJson(raw))
-        if (!json.optString("status").equals("success", ignoreCase = true)) return null
-        return json.optInt("task_id", -1).takeIf { it >= 0 }
-    }
+    /**
+     * الـ payload مفيهوش /api/find_task، فبنرجّع null لو فشل
+     * بدل ما يوقف الـ flow. الاعتماد الأساسي على task_id من install().
+     */
+    fun findTask(ps4Ip: String, contentId: String, subType: Int): Int? =
+        runCatching {
+            val raw = post(
+                ps4Ip,
+                "/api/find_task",
+                JSONObject()
+                    .put("content_id", contentId)
+                    .put("sub_type", subType)
+            )
+            val json = JSONObject(normalizeJson(raw))
+            if (!json.optString("status").equals("success", ignoreCase = true)) {
+                null
+            } else {
+                json.optInt("task_id", -1).takeIf { it >= 0 }
+            }
+        }.getOrNull()
 
     fun progress(ps4Ip: String, taskId: Int): JSONObject {
         val raw = post(
@@ -83,8 +112,8 @@ object RpiClient {
         return JSONObject(normalizeJson(raw))
     }
 
-    // Control commands: original RPI reads "task_id", the payload reads
-    // the command name as the key (e.g. {"stop_task": 215}). Send both.
+    // الـ payload بيقرأ اسم الأمر كمفتاح ({"stop_task": 215})،
+    // والـ RPI الأصلي بيقرأ task_id. بنبعت الاتنين.
     private fun control(ip: String, cmd: String, taskId: Int): String =
         post(ip, "/api/$cmd", JSONObject().put("task_id", taskId).put(cmd, taskId))
 
@@ -95,6 +124,16 @@ object RpiClient {
     fun stop(ps4Ip: String, taskId: Int) = control(ps4Ip, "stop_task", taskId)
 
     fun unregister(ps4Ip: String, taskId: Int) = control(ps4Ip, "unregister_task", taskId)
+
+    /**
+     * إلغاء كامل: stop ← انتظار 1.5 ثانية ← unregister.
+     * بيحجز الـ thread، فنادي عليه من background thread / coroutine (Dispatchers.IO).
+     */
+    fun cancel(ps4Ip: String, taskId: Int) {
+        runCatching { stop(ps4Ip, taskId) }
+        Thread.sleep(1600)
+        unregister(ps4Ip, taskId)
+    }
 
     private fun post(ip: String, path: String, json: JSONObject): String {
         var conn: HttpURLConnection? = null
@@ -118,11 +157,7 @@ object RpiClient {
 
             val code = conn.responseCode
             val stream =
-                if (code in 200..299) {
-                    conn.inputStream
-                } else {
-                    conn.errorStream
-                }
+                if (code in 200..299) conn.inputStream else conn.errorStream
 
             val text = readLimited(stream, 8192)
 
@@ -140,10 +175,7 @@ object RpiClient {
         }
     }
 
-    private fun readLimited(
-        input: InputStream?,
-        maxChars: Int
-    ): String {
+    private fun readLimited(input: InputStream?, maxChars: Int): String {
         if (input == null || maxChars <= 0) return ""
 
         return input.bufferedReader(Charsets.UTF_8).use { reader ->
