@@ -1,35 +1,35 @@
-    private fun normalizeJson(raw: String): String {
-        return raw.replace(Regex("""0[xX][0-9a-fA-F]+""")) { match ->
-            val hex = match.value.substring(2)
-            runCatching { hex.toULong(16).toString() }.getOrElse { "0" }
-        }
+package com.pkgpocket.app
+
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+
+object RpiClient {
+
+    data class InstallResult(val taskId: Int?, val raw: String)
+
+    fun install(ps4Ip: String, pkgUrl: String): InstallResult {
+        val body = JSONObject()
+            .put("type", "direct")
+            .put("packages", org.json.JSONArray().put(pkgUrl))
+            // Payload compatibility: it expects {"url": "..."}
+            .put("url", pkgUrl)
+
+        val raw = post(ps4Ip, "/api/install", body)
+        val json = JSONObject(normalizeJson(raw))
+        val id = json.optInt("task_id", -1).takeIf { it >= 0 }
+        return InstallResult(id, raw)
     }
 
-    fun bytesTotal(j: JSONObject): Long =
-        j.optLong("length_total", j.optLong("length", 0L))
-
-    fun bytesDone(j: JSONObject): Long =
-        j.optLong("transferred_total", j.optLong("transferred", 0L))
-
-    fun restSeconds(j: JSONObject): Long {
-        val total = j.optLong("rest_sec_total", -1L)
-        if (total > 0L) return total
-        return j.optLong("rest_sec", -1L)
+    fun findTask(ps4Ip: String, contentId: String, subType: Int): Int? {
+        val raw = post(
+            ps4Ip,
+            "/api/find_task",
+            JSONObject()
+                .put("content_id", contentId)
+                .put("sub_type", subType)
+        )
+        val json = JSONObject(normalizeJson(raw))
+        if (!json.optString("status").equals("success", ignoreCase = true)) return null
+        return json.optInt("task_id", -1).takeIf { it >= 0 }
     }
-
-    fun percent(j: JSONObject): Int {
-        val total = bytesTotal(j)
-        val done = bytesDone(j)
-        return if (total > 0) {
-            ((done * 100L) / total).toInt().coerceIn(0, 100)
-        } else {
-            j.optInt("preparing_percent", 0).coerceIn(0, 100)
-        }
-    }
-
-    fun isFinished(j: JSONObject): Boolean {
-        val total = bytesTotal(j)
-        val done = bytesDone(j)
-        return total > 0 && done >= total
-    }
-}
