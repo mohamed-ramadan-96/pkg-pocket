@@ -388,6 +388,261 @@ class InstallerService : Service() {
                 finishError(
                     getString(R.string.error_no_pkgs),
                     analyticsReason = "empty_queue"
+            }
+
+            if (BuildConfig.PUBLIC_BETA && !PublicBetaUsage.canFit(this@InstallerService, ordered)) {
+                finishError(
+                    getString(
+                        R.string.public_beta_service_queue_too_large,
+                        PublicBetaUsage.requestedGames(ordered),
+                        PublicBetaUsage.remainingGames(this@InstallerService),
+                        PublicBetaUsage.requestedDlcs(ordered),
+                        PublicBetaUsage.remainingDlcs(this@InstallerService),
+                        PublicBetaUsage.requestedUpdates(ordered),
+                        PublicBetaUsage.remainingUpdates(this@InstallerService)
+                    ),
+                    analyticsReason = "beta_limit"
+                )
+                return@launch
+            }
+
+            val queueStartedAt = SystemClock.elapsedRealtime()
+            val totalSize = ordered.sumOf { it.size.coerceAtLeast(0L) }
+
+            analyticsInstallStartedAt = queueStartedAt
+            analyticsInstallPkgCount = ordered.size
+            analyticsInstallTotalBytes = totalSize
+
+            AnalyticsTracker.installStarted(
+                this@InstallerService,
+                ordered
+            )
+            var completedBytes = 0L
+            var activeItem: PkgItem? = null
+
+            try {
+                ordered.forEachIndexed { index, item ->
+                    if (cancelRequested) return@launch
+
+                    activeItem = item
+                    currentItemToken = item.token
+                    currentItemPercent = 0
+                    currentItemDetail = getString(R.string.calculating_time)
+
+                    val position = index + 1
+                    val kind = kindLabel(item.kind)
+                    val baseOverall = overallPercent(completedBytes, totalSize)
+
+                    publishTransfer(
+                        item = item,
+                        title = item.title,
+                        topText = getString(R.string.top_preparing, position, ordered.size, kind),
+                        itemStatus = getString(R.string.state_preparing),
+                        itemDetail = getString(R.string.calculating_time),
+                        itemPercent = -1,
+                        overallPercent = baseOverall,
+                        overallText = getString(
+                            R.string.overall_preparing,
+                            position,
+                            ordered.size,
+                            baseOverall
+                        )
+                    )
+
+                    val activeServer = server ?: error(getString(R.string.error_server_not_started))
+                    val url = activeServer.urlFor(localIp, item)
+
+                    logOnly(getString(R.string.log_install_request, kind, item.title))
+
+                    val installAttempt = runCatching { RpiClient.install(ps4Ip, url) }
+                    var task = installAttempt.getOrNull()?.taskId
+
+                    if (task == null) {
+                        val originalError = installAttempt.exceptionOrNull()
+                        if (originalError is RpiClient.PayloadException) throw originalError
+
+                        publishTransfer(
+                        }
+
+                        logOnly(getString(R.string.log_task_recovered, task!!))
+                    } else {
+                        logOnly(getString(R.string.log_task_started, task!!, item.title))
+                    }
+
+                    var activeTask = task ?: error(getString(R.string.error_no_task))
+                    currentTaskId = activeTask
+
+                    var done = false
+                    var statusFailures = 0
+                    var pollDelayMs = 5000L
+                    var lastPc = 0
+                    var lastMeta = getString(R.string.calculating_time)
+                    var lastOverall = baseOverall
+                    var lastOverallText = getString(
+                        R.string.overall_preparing,
+                        position,
+                        ordered.size,
+                        baseOverall
+                    )
+                    var smoothedEtaSeconds: Double? = null
+                    val samples = mutableListOf<TransferSample>()
+                    val itemStartedAt = SystemClock.elapsedRealtime()
+
+                    publishTransfer(
+                        item = item,
+                        title = item.title,
+                        topText = getString(R.string.top_sending_initial, position, ordered.size, kind),
+                        itemStatus = getString(R.string.state_sending_percent, 0),
+                        itemDetail = lastMeta,
+                        itemPercent = 0,
+                        overallPercent = baseOverall,
+                        overallText = lastOverallText
+                    )
+
+                    while (!done && !cancelRequested) {
+                        delay(pollDelayMs)
+
+                        val progressAttempt = runCatching {
+                            RpiClient.progress(ps4Ip, activeTask)
+                        }
+
+                        if (progressAttempt.isFailure) {
+                            statusFailures++
+                            pollDelayMs = (pollDelayMs + 5000L).coerceAtMost(20_000L)
+
+                            publishTransfer(
+                                item = item,
+                                title = item.title,
+                                topText = getString(
+                                    R.string.top_waiting_ps4,
+                                    position,
+                                    ordered.size
+                                ),
+                                itemStatus = getString(R.string.state_waiting_ps4),
+                                itemDetail = lastMeta,
+                                itemPercent = lastPc,
+                                overallPercent = lastOverall,
+                                overallText = lastOverallText
+                            )
+
+                            if (statusFailures == 1) {
+                                logOnly(
+                                    getString(
+                                        R.string.log_status_flaky,
+                                        statusFailures
+                                    )
+                                )
+
+                                progressAttempt.exceptionOrNull()?.let { error ->
+                                    logOnly(
+                                        "Falha RPI detalhada • task=$activeTask • " +
+                                            "${error.javaClass.simpleName}: " +
+                                            "${error.message ?: "sem detalhes"}"
+                                    )
+                                }
+                            }
+
+                            if (statusFailures >= RPI_STALL_FAILURES) {
+                                waitingForRpiRecovery = true
+                                retryRpiRequested = false
+
+                                logOnly(
+                                    getString(
+    }
+
+    private fun transferDetail(
+        transferred: Long,
+        total: Long,
+        speed: Double,
+        etaSeconds: Long
+    ): String {
+        val amount = getString(
+            R.string.transfer_amount,
+            humanSize(transferred),
+          ifEmpty { PkgRepository.items.toList() }
+
+        analyticsInstallStartedAt = 0L
+        analyticsInstallPkgCount = transferItems.size
+        analyticsInstallTotalBytes =
+            transferItems.sumOf { it.size.coerceAtLeast(0L) }
+
+        cancelRequested = false
+        currentPs4Ip = ps4Ip
+        currentItemToken = null
+        currentItemPercent = 0
+        currentItemDetail = ""
+        lastOverallPercent = 0
+        waitingForRpiRecovery = false
+        retryRpiRequested = false
+        val serverReady = restartServer(transferItems)
+
+        installJob = scope.launch {
+            acquirePerformanceLocks()
+
+            if (!serverReady) {
+                finishError(
+                    getString(R.string.error_http_ports_busy),
+                    analyticsReason = "http_port_busy"
+                )
+                return@launch
+            }
+
+            val localIp = NetworkUtils.localIpv4()
+            if (localIp == null) {
+                finishError(
+                    getString(R.string.error_no_ipv4),
+                    analyticsReason = "no_local_ipv4"
+                )
+                return@launch
+            }
+
+            val configuredRpiPort =
+                getSharedPreferences(
+                    "pkg_pocket",
+                    MODE_PRIVATE
+                ).getInt(
+                    "rpi_port",
+                    RpiClient.getPort()
+                )
+
+            RpiClient.setPort(configuredRpiPort)
+
+            if (
+                !NetworkUtils.canConnect(
+                    ps4Ip,
+                    configuredRpiPort
+                )
+            ) {
+                finishError(
+                    getString(
+                        R.string.error_rpi_not_found,
+                        ps4Ip,
+                        configuredRpiPort
+                    ),
+                    analyticsReason = "rpi_unreachable"
+                )
+                return@launch
+            }
+
+            val ordered = transferItems.sortedWith(
+                compareBy<PkgItem>(
+                    {
+                        when (it.kind) {
+                            PkgKind.GAME -> 0
+                            PkgKind.UPDATE -> 1
+                            PkgKind.DLC -> 2
+                            PkgKind.OTHER -> 3
+                        }
+                    },
+                    { it.titleId },
+                    { it.fileName }
+                )
+            )
+
+            if (ordered.isEmpty()) {
+                finishError(
+                    getString(R.string.error_no_pkgs),
+                    analyticsReason = "empty_queue"
                 )
                 return@launch
             }
